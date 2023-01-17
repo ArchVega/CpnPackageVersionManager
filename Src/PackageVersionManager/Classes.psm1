@@ -34,7 +34,7 @@ class SetPackageVersionUpdateAction {
 }
 
 class SetPackageVersionFunctionInfo {
-    [SolutionDirectory[]] $SolutionDirectories = @()
+    [GitDirectory[]] $GitDirectories = @()
     [string] $PackageName
     [string] $PackageTargetVersion
     [SetPackageVersionUpdateAction[]] $UpdateActions = @();
@@ -42,9 +42,9 @@ class SetPackageVersionFunctionInfo {
     [bool] $PackageVersionExistsInNexus
 
     [void] GenerateUpdateActions() {
-        foreach($solutionDirectory in $this.SolutionDirectories) {
-            foreach($csProjFile in $solutionDirectory.CsProjFiles) {
-                foreach($packageReference in $csProjFile.PackageReferences) {
+        foreach ($gitDirectory in $this.GitDirectories) {
+            foreach ($csProjFile in $gitDirectory.CsProjFiles) {
+                foreach ($packageReference in $csProjFile.PackageReferences) {
                     if ($packageReference.Name -eq $this.PackageName -and $packageReference.Version -ne $this.PackageTargetVersion) {
                         $this.UpdateActions += [SetPackageVersionUpdateAction]::new(
                             $csProjFile.FileInfo, 
@@ -84,11 +84,11 @@ class CsProjFile {
     }
 }
 
-class SolutionDirectory {
+class GitDirectory {
     [System.IO.DirectoryInfo] $DirectoryInfo
     [CsProjFile[]] $CsProjFiles = @()    
     
-    SolutionDirectory([string] $path) {
+    GitDirectory([string] $path) {
         $this.DirectoryInfo = [System.IO.DirectoryInfo]::new($path)
         $this.CsProjFiles = Get-ChildItem -Path $this.DirectoryInfo.FullName -Recurse -Filter "*.csproj" -File | ForEach-Object { [CsProjFile]::new($_.FullName) }
     }    
@@ -96,11 +96,98 @@ class SolutionDirectory {
 
 class AppConfig {
     [string] $NexusBaseUrl
+    [string[]] $SourceRootDirectories
+    [string[]] $PackageNames    
+}
+
+class VegaSemanticVersion : System.IComparable {
+    hidden [Regex] $RegexPattern = [Regex]::new("^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$")
+    hidden [Regex] $RegexPattern2 = [Regex]::new("(\d+)\.(\d+)\.(\d+)\.(.*)")
+    [int] $Major
+    [int] $Minor
+    [int] $Patch
+    [string] $PreRelease
+    [string] $Build
+    [string] $Label
+    [bool] $IsPreRelease
+    [bool] $IsParsable
+    [string] $Short
+
+    hidden [string] $semVerString
+
+    VegaSemanticVersion([string] $SemVerString) {
+        $this.semVerString = $SemVerString
+
+        $semVerMatches = $this.RegexPattern.Matches($SemVerString)
+
+        if ($semVerMatches.Count -eq 0) {
+            $semVerMatches = $this.RegexPattern2.Matches($SemVerString)
+        }
+
+        $this.IsParsable = $true
+
+        try {
+            $this.Major = $semVerMatches[0].Groups[1].Value
+            $this.Minor = $semVerMatches[0].Groups[2].Value
+            $this.Patch = $semVerMatches[0].Groups[3].Value
+            $this.PreRelease = $semVerMatches[0].Groups[4].Value
+            $this.Build = $semVerMatches[0].Groups[5].Value
+            $this.Label = "$($this.PreRelease)$($this.Build)"
+            $this.IsPreRelease = -not([string]::IsNullOrWhiteSpace($this.PreRelease))
+            $this.Short = $this.GenerateSemVerShortTag()
+        }
+        catch {
+            $this.IsParsable = $false
+        }
+    }
+
+    hidden [string] GenerateSemVerShortTag() {
+        return "$($this.Major).$($this.Minor).$($this.Patch)"
+    }
+
+    [string] ToString() {
+        return $this.semVerString
+    }    
+
+    [int] CompareTo($object) {
+        if (-not $this.IsParsable) {
+            return 0
+        }
+
+        if (-not $this.IsParsable) {
+            return 0
+        }
+
+        $other = [VegaSemanticVersion]$object
+        if ($this.Major -gt $other.Major) {
+            return 1
+        }
+        elseif ($this.Major -eq $other.Major) {
+            if ($this.Minor -gt $other.Minor) {
+                return 1
+            }
+            elseif ($this.Minor -eq $other.Minor) {
+                if ($this.Patch -gt $other.Patch) {
+                    return 1
+                }
+                elseif ($this.Patch -eq $other.Patch) {
+                    return $this.Label.CompareTo($other.Label)
+                }
+
+                return -1
+            }
+
+            return -1
+        }
+
+        return -1
+    }
 }
 
 class NugetPackage {
     [string] $Name
     [string] $Version
+    [VegaSemanticVersion] $SemanticVersion
     [bool] $IsLatestVersion
     [bool] $IsPreRelease
 
@@ -109,5 +196,47 @@ class NugetPackage {
         $this.Version = $nexusResponseData.Version
         $this.IsLatestVersion = $nexusResponseData.assets.nuget.is_latest_version
         $this.IsPreRelease = $nexusResponseData.assets.nuget.is_prerelease
+        $this.SemanticVersion = [VegaSemanticVersion]::new($this.Version)
+    }
+}
+
+class NexusPackageQueryResultItem : System.IComparable {
+    [string] $PackageName  
+    [NugetPackage] $NugetPackage
+    [string] $Version
+    [bool] $Exists  
+
+    NexusPackageQueryResultItem($packageName, $nugetPackage, $version, $exists) {
+        $this.PackageName = $packageName
+        $this.NugetPackage = $nugetPackage
+        $this.Version = $version
+        $this.Exists = $exists
+    }
+
+    [int] CompareTo([object] $obj) {
+        try {
+            $other = [VegaSemanticVersion]$obj.NugetPackage.SemanticVersion
+        
+            return $this.NugetPackage.SemanticVersion.CompareTo($other)
+        }
+        catch {
+            return 0
+        }
+    }
+}
+
+class CsProjPackageReferenceItem {
+    [System.IO.DirectoryInfo] $GitDirectoryInfo
+    [System.IO.FileInfo] $CsProjFileInfo  
+    [string] $CsProjRelativePath
+    [string] $PackageName       
+    [string] $Version           
+
+    CsProjPackageReferenceItem($gitDirectoryInfo, $csProjFileInfo, $csProjRelativePath, $packageName, $version) {
+        $this.GitDirectoryInfo = $gitDirectoryInfo
+        $this.CsProjFileInfo = $csProjFileInfo
+        $this.CsProjRelativePath = $csProjRelativePath
+        $this.PackageName = $packageName
+        $this.Version = $version
     }
 }

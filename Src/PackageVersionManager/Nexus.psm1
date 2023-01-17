@@ -1,16 +1,103 @@
 using module .\Classes.psm1
 
-function Test-NexusPackageExists {
-    [CmdletBinding()]
+# Gets latest non-prerelease package by default
+function Get-NexusPackage {
+    [CmdletBinding(DefaultParameterSetName = 'StoredPackageNames')]
     param(
-        [Parameter(Mandatory)]
-        [string] $PackageName
+        [Parameter(ParameterSetName = 'SpecifiedPackageNames')]
+        [string[]] $PackageName,
+        [Parameter(ParameterSetName = 'SpecifiedPackageNames')]
+        [string] $PackageVersion,
+        [Parameter()]
+        [switch] $VerifyPackageExists,
+        [Parameter()]
+        [switch] $ListAllVersions,
+        [Parameter()]
+        [switch] $IncludePreReleaseVersions
     )
+    
+    $errorMessageMultiplePackageNamesForVersion = "Cannot call Get-NexusPackage with more than one PackageName and PackageVersion. Please either provide a single PackageName with -PackageVersion or remove -PackageVersion."
+    
+    $packageVersionParameterProvided = -not([System.String]::IsNullOrWhiteSpace($PackageVersion))
 
-    return $null -ne (Get-NexusPackages -PackageName $PackageName)
+    if ($PSCmdlet.ParameterSetName -eq "StoredPackageNames") {
+        $PackageName = (GetConfig).PackageNames
+    }
+    elseif ($PSCmdlet.ParameterSetName -eq "SpecifiedPackageNames") {
+        if ($PackageName.Count -eq 0) {
+            throw "Must provide a PackageName if a PackageVersion is specified. Only one PackageName is supported when PackageVersion is supplied as well."
+        }
+
+        if ($packageVersionParameterProvided -and $PackageName.Count -gt 1) {
+            throw $errorMessageMultiplePackageNamesForVersion
+        }
+    }
+
+    if ($VerifyPackageExists.IsPresent) {
+        if (-not $packageVersionParameterProvided) {
+            return $PackageName | NexusPackageQuery -SimpleExists
+        }
+        
+        if ($PackageName.Count -gt 1) {
+            throw $errorMessageMultiplePackageNamesForVersion
+        }
+
+        $package = GetNexusPackageVersion -PackageName $PackageName[0] -PackageVersion $PackageVersion
+        return ($null -ne $package)
+    }
+    else {
+        if ($packageVersionParameterProvided) {
+            $packages = $PackageName | NexusPackageQuery
+        
+            return ($packages | Where-Object { $_.Version -eq $PackageVersion }).Count -gt 0
+        }
+
+        $packages = $PackageName | NexusPackageQuery
+
+        [Array]::Sort($packages)
+
+        if (-not $IncludePreReleaseVersions.IsPresent) {
+            $packages = $packages | Where-Object { -not $_.NugetPackage.IsPreRelease }
+        }
+
+        if (-not $ListAllVersions.IsPresent) {
+            return ($packages | Group-Object PackageName) | ForEach-Object { $_.Group[-1] }
+        }
+        
+        return $packages
+    }
 }
 
-function Test-NexusPackageVersionExists {
+# Private Members ---------------------------------------------------------------------------------------------------------------------------------------
+
+function NexusPackageQuery {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline, Mandatory)]
+        [string] $PackageName,
+        [switch] $SimpleExists
+    )
+
+    process {        
+        $restUriPath = "search?repository=nuget-hosted&nuget.id=$PackageName"
+        $componentSearchUri = ConstructNexusApiUri -RestUriPath $restUriPath
+        $components = ExecuteNexusMultiPageRestApiGetMethod -Uri $componentSearchUri
+    
+        if ($SimpleExists.IsPresent) {            
+            return [NexusPackageQueryResultItem]::new($PackageName, $null, $null, $null -ne $components)
+        }
+                
+        if ($null -eq $components) {
+            return [NexusPackageQueryResultItem]::new($PackageName, $null, $null, $false)
+        }
+
+        return $components | ForEach-Object {
+            return [NexusPackageQueryResultItem]::new($PackageName, [NugetPackage]::new($_), $_.version, $true)
+        }
+    }
+}
+
+function GetNexusPackageVersion {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -19,102 +106,70 @@ function Test-NexusPackageVersionExists {
         [string] $PackageVersion
     )
 
-    $packages = Get-NexusPackages -PackageName $PackageName
-    
-    return ($packages | Where-Object { $_.Version -eq $PackageVersion }).Count -gt 0
+    process {        
+        $restUriPath = "search?repository=nuget-hosted&version=$PackageVersion&nuget.id=$PackageName"
+        $componentSearchUri = ConstructNexusApiUri -RestUriPath $restUriPath
+        
+        return ExecuteNexusRestApiGetMethod -Uri $componentSearchUri        
+    }
 }
 
-function Get-NexusPackages {
+function ConstructNexusApiUri {
+    param(        
+        [Parameter(Mandatory)]
+        [string] $RestUriPath
+    )
+
+    return "$(Get-StoredNexusUrl)/service/rest/v1/$RestUriPath"
+}
+
+function ExecuteNexusMultiPageRestApiGetMethod {
+    param(
+        # After "v1/"
+        [Parameter(Mandatory)]
+        [string] $Uri
+    )
+
+    $data = @()
+    
+    do {        
+        $restMethodResult = ExecuteNexusRestApiGetMethod -Uri $Uri -ContinuationToken $continuationToken -ReturnRestResponse
+        $data += $restMethodResult.items
+        $continuationToken = $restMethodResult.continuationToken
+    } while ($null -ne $continuationToken)
+
+    return $data
+}
+
+function ExecuteNexusRestApiGetMethod {
     param(
         [Parameter(Mandatory)]
-        [string] $PackageName,
-        [switch] $LatestVersion
+        [string] $Uri,
+        [Parameter()]
+        [string] $ContinuationToken,
+        [Parameter()]
+        [switch] $ReturnRestResponse
     )
-    
-    $searchParameters = "repository=nuget-hosted&format=nuget&name=$packageName&sort=version"
-    $repositoriesUrl = "$(Get-NexusUrl)/service/rest/v1/search"
-    $url = "$($repositoriesUrl)?$searchParameters"
-    $results = @()
-    $json = Invoke-RestMethod $url -Headers @{ accept = "application/json" }
-    $results += $json.items
-    $continuationToken = $json.continuationToken
-    
-    $finalResults = @()
 
-    if ($null -eq $continuationToken) {
-        $finalResults = $results | ForEach-Object { [NugetPackage]::new($_) }
+    $headers = @{ accept = "application/json" }
+
+    if (-not [System.String]::IsNullOrWhiteSpace($ContinuationToken)) {
+        $Uri += "&continuationToken=$ContinuationToken"
     }
-    else {
-        while ($null -ne $continuationToken) {
-            $continueUrl = $url + "&continuationToken=$continuationToken"
-            $json = Invoke-RestMethod $continueUrl -Headers @{ accept = "application/json" }
-            $results += $json.items
-            $continuationToken = $json.continuationToken
+
+    $results = Invoke-RestMethod -Uri $uri -Headers $headers 
+
+    if ($results.items.Count -gt 0) {
+        if ($ReturnRestResponse.IsPresent) {
+            return $results
         }
-    
-        $finalResults = $results | ForEach-Object { [NugetPackage]::new($_) }
-    }    
-    
-    if ($LatestVersion.IsPresent) {
-        return ($finalResults | Where-Object { $_.IsLatestVersion }).Version
+
+        return $results.items
     }
-    
-    return $finalResults
+
+    return $null
 }
 
-
-function  GetNexusPackageOld($searchParameters) {
-    $repositoriesUrl = "$(Get-NexusUrl)/service/rest/v1/search"
-    $url = "$($repositoriesUrl)?$searchParameters"
-    $results = @()
-    $json = Invoke-RestMethod $url -Headers @{ accept = "application/json" }
-    $results += $json.items
-    $continuationToken = $json.$continuationToken
-    if ($null -eq $continuationToken) {
-        return $results
-    }
-    
-    while ($null -ne $continuationToken) {
-        $continuationToken = $url + "&continuationToken=$continuationToken"
-        $json = Invoke-RestMethod $continueUrl -Headers @{ accept = "application/json" }
-        $results += $json.items
-        $continuationToken = $json.continuationToken
-    }
-
-    return $results
-}
-
-function GetNexusPackagesByBranchOld([string] $packageName, [string] $branchName) {
-    $isMaster = $branchName.ToLowerInvariant() -eq "master"
-    $versionSearchPattern = $branchName.ToLowerInvariant().Replace("/", "-")
-
-    if ($isMaster) {
-        $searchParameters = "repository=nuget-hosted&format=nuget&name=$packageName&sort=version"
-    }
-    else {
-        $searchParameters = "repository=nuget-hosted&format=nuget&name=$packageName&version=$versionSearchPattern&sort=version"
-    }
-
-    $result = GetNexusPackage $searchParameters
-
-    if ($isMaster) {
-        $result = $result | Where-Object { $_.assets.nuget.is_latest_version -and $_.assets.nuget.is_prerelease -eq $false }
-    }
-    else {
-        $result = $result | Where-Object { $_.assets.nuget.is_latest_version -and $_.assets.nuget.is_prerelease -eq $true }
-    }
-
-    if ($result.Count -eq 0) {
-        throw "Package '$packageName' had zero packages found in Nexus, search = '$searchParameters'"
-    }
-
-    if ($result.Count -gt 1) {
-        throw "Multiple packages for '$packageName' were found. Only one package should be returned. This may be a bug in this module. search = '$searchParameters'"
-    }
-
-    return [ordered]@{
-        Name         = $packageName
-        Version      = $result.version
-        LastModified = $result.assets[0].lastModified
-    }
+function GetConfig() {
+    return Get-Content $global:PackageVersionManagerAppConfigPath -Raw | ConvertFrom-Json
 }
