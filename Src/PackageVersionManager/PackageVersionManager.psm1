@@ -1,148 +1,153 @@
 using module .\Classes.psm1
 
-$script:AppFolderPath = Join-Path $env:LOCALAPPDATA -ChildPath "VegaPackageVersionManager"
-$script:AppConfigPath = Join-Path $script:AppFolderPath -ChildPath "Configuration.json"
+# AppConfig paths should be available everywhere. Placing them in the main module here.
+$global:PackageVersionManagerAppFolderPath = Join-Path $env:LOCALAPPDATA -ChildPath "VegaPackageVersionManager"
+$global:PackageVersionManagerAppConfigPath = Join-Path $global:PackageVersionManagerAppFolderPath -ChildPath "Configuration.json"
 
-# Exported Members ---------------------------------------------------------------------------------------------------------------------------------------
-
-function Get-NexusUrl {
+function Get-CsProjPackageReference {
     [CmdletBinding()]
-    param()
+    param(        
+        [Parameter()]
+        [string[]] $PackageName,
+        [Parameter()]
+        [string[]] $SourceRootDirectory,
+        [Parameter()]
+        [switch] $Simple
+    )
 
-    CreateUserProfileAppFolderIfItDoesNotExist
-    $config = Get-Content $script:AppConfigPath -Raw | ConvertFrom-Json
+    $packageNames = $PackageName
+    $sourceRootDirectories = $SourceRootDirectory
+
+    if ($PackageName.Count -eq 0) {
+        $packageNames = (GetConfig).PackageNames        
+    }
+
+    if ($SourceRootDirectory.Count -eq 0) {
+        $sourceRootDirectories = (GetConfig).SourceRootDirectories
+    }
+
+    $gitDirectories = GetGitDirectories -DirectoryPaths @($sourceRootDirectories)
+
+    $result = @()
+    foreach ($gitDirectory in $gitDirectories) {        
+        foreach ($packageName in $packageNames) {
+            $csProjPackageReferences = $gitDirectory.CsProjFiles | ForEach-Object { [CsProjPackageReference]::new($_.FileInfo, $_.PackageReferences) }
     
-    return $config.NexusBaseUrl
-}
+            foreach ($csProjPackageReference in $csProjPackageReferences) {
+                foreach ($packageReference in $csProjPackageReference.PackageReferences) {
+                    if ($packageReference.Name -eq $packageName) {
+                        $csProjFileRelPath = $csProjPackageReference.CsProjFileInfo.FullName.Substring($gitDirectory.DirectoryInfo.FullName.Length)
 
-function Set-NexusUrl {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateScript({ 
-                return [System.Uri]::IsWellFormedUriString($_, 'Absolute')
-            })]
-        [string] $NexusBaseUrl
-    )
-
-    CreateUserProfileAppFolderIfItDoesNotExist
-    $config = Get-Content $script:AppConfigPath -Raw | ConvertFrom-Json
-    $config.NexusBaseUrl = $NexusBaseUrl
-    $config | ConvertTo-Json -Depth 32 | Set-Content $script:AppConfigPath
-}
-
-function Get-PackageReference {
-    param(
-        [Parameter(ValueFromPipeline, Mandatory)]
-        [ValidateScript({ 
-                Test-Path -Path $_ -PathType Container 
-            })]
-        [string] $SolutionDirectoryPath,
-        [Parameter(Mandatory)]
-        [string] $PackageName
-    )
-
-    process {
-        $solutionDirectory = [SolutionDirectory]::new($SolutionDirectoryPath); 
-
-        $csProjPackageReferences = $solutionDirectory.CsProjFiles | ForEach-Object { [CsProjPackageReference]::new($_.FileInfo, $_.PackageReferences) }
-
-        $result = @()
-        foreach($csProjPackageReference in $csProjPackageReferences) {
-            foreach($packageReference in $csProjPackageReference.PackageReferences) {
-                if ($packageReference.Name -eq $PackageName) {
-                    $result += [pscustomobject][ordered]@{
-                        CsProjFullName = $csProjPackageReference.CsProjFileInfo.FullName
-                        Version = $packageReference.Version
+                        if ($Simple.IsPresent) {
+                            $result += [pscustomobject][ordered]@{
+                                GitDirectoryFullName = $gitDirectory.DirectoryInfo.Name                                
+                                CsProjRelativePath   = $csProjFileRelPath
+                                PackageName          = $packageReference.Name.Trim()
+                                Version              = $packageReference.Version.Trim()
+                            }
+                        }
+                        else {
+                            $result += [CsProjPackageReferenceItem]::new(
+                                $gitDirectory.DirectoryInfo,
+                                $csProjPackageReference.CsProjFileInfo,
+                                $csProjFileRelPath,
+                                $packageReference.Name,
+                                $packageReference.Version
+                            )                                 
+                        }
                     }
                 }
             }
         }
+    }    
 
-        return $result
+    if ($Simple.IsPresent) {
+        return $result | Sort-Object GitDirectoryFullName, CsProjRelativePath, PackageName
     }
+
+    return $result | Sort-Object CsProjFileInfo, PackageName
 }
 
-function Set-PackageReferenceVersion {
+function Edit-CsProjPackageReference {
     [CmdletBinding(SupportsShouldProcess)]
-    param(
+    param(        
         [Parameter(ValueFromPipeline, Mandatory)]
-        [ValidateScript({ 
-                Test-Path -Path $_ -PathType Container 
-            })]
-        [string] $SolutionDirectoryPath,
-        [Parameter(Mandatory)]
-        [string] $PackageName,
-        [Parameter(Mandatory, ParameterSetName = 'SpecificVersion')]
-        [string] $PackageVersion,
-        [Parameter(Mandatory, ParameterSetName = 'LatestVersion')]
+        [CsProjPackageReferenceItem] $CsProjPackageReferenceItem,
+        [Parameter()]
         [switch] $LatestVersion
     )
 
     begin {
-        $info = [SetPackageVersionFunctionInfo]::new();
+        $fetchedPackages = @{}
     }
 
     process {
-        $info.PackageName = $PackageName
-
-        if ($LatestVersion.IsPresent) {
-            $info.PackageTargetVersion = Get-NexusPackages -PackageName $PackageName -LatestVersion:$LatestVersion
-        }
-        else {
-            $info.PackageTargetVersion = $PackageVersion
-        }        
+        $xml = [xml] (Get-Content $CsProjPackageReferenceItem.CsProjFileInfo.FullName -Raw)                
+        $results = @()
         
-        $solutionDirectory = [SolutionDirectory]::new($SolutionDirectoryPath);
-        $info.SolutionDirectories += $solutionDirectory
-    }
+        $packageReferences = $xml.Project.ItemGroup.PackageReference        
+        foreach ($packageReference in $packageReferences) {
+            $package = $fetchedPackages[$packageReference.Include]
+            if ($null -eq $package) {
+                $package = Get-NexusPackage -PackageName $packageReference.Include
+                $fetchedPackages[$packageReference.Include] = $package
+            }
 
-    end {
-        $info.GenerateUpdateActions()
-        $info.PackageExistsInNexus = Test-NexusPackageExists $info.PackageName
-        if ($info.PackageExistsInNexus) {
-            $info.PackageVersionExistsInNexus = Test-NexusPackageVersionExists $info.PackageName $info.PackageTargetVersion
-        }
-
-        if (-not $info.PackageExistsInNexus) {
-            throw [System.IO.FileNotFoundException]::new("Package '$($info.PackageName)' does not exist in Nexus", $info)  
-        }
-
-        if (-not $info.PackageVersionExistsInNexus) {
-            throw [System.IO.FileNotFoundException]::new("Package version '$($PackageVersion)' for package '$($info.PackageName)' does not exist in Nexus", $info)
-        }
-
-        if ($PSCmdlet.ShouldProcess($SolutionDirectoryPath)) {
-            foreach ($updateAction in $info.UpdateActions) {
-                $xml = [xml] (Get-Content $updateAction.CsProjFileInfo.FullName -Raw)                
-                $packageReferences = $xml.Project.ItemGroup.PackageReference
-                foreach ($packageReference in $packageReferences) {
-                    if ($packageReference.Include -eq $updateAction.PackageName) {
-                        $packageReference.Version = $updateAction.TargetPackageVersion
-                    }
+            if ($packageReference.Include -eq $package.PackageName) {                
+                $packageReference.Version = $package.Version
+                $results += [pscustomobject][ordered]@{
+                    CsProjFileInfoFullName = $CsProjPackageReferenceItem.CsProjRelativePath
+                    PackageName = $package.PackageName
+                    FromVersion = $CsProjPackageReferenceItem.Version
+                    ToVersion = $package.Version
                 }
-                $xml.Save($updateAction.CsProjFileInfo.FullName)            
-            }    
+            }
         }
-        else {
-            return $info
+
+        if ($PSCmdlet.ShouldProcess($CsProjPackageReferenceItem.CsProjFileInfo.FullName)) {
+            $xml.Save($updateAction.CsProjFileInfo.FullName)
         }
+
+        return $results
     }
 }
 
-# Private Members ---------------------------------------------------------------------------------------------------------------------------------------
-
+# Move this to shared as it's a duplicate from StoredData
 function CreateUserProfileAppFolderIfItDoesNotExist() {    
-    if (-not (Test-Path $script:AppFolderPath)) {
-        New-Item $script:AppFolderPath -ItemType Directory | Out-Null
+    if (-not (Test-Path $global:PackageVersionManagerAppFolderPath)) {
+        New-Item $global:PackageVersionManagerAppFolderPath -ItemType Directory | Out-Null
     }
 
-    if (-not (Test-Path $script:AppConfigPath)) {
+    if (-not (Test-Path $global:PackageVersionManagerAppConfigPath)) {
         $appConfig = [AppConfig]::new()
-        $appConfig | ConvertTo-Json -Depth 32 | Set-Content $script:AppConfigPath
+        $appConfig | ConvertTo-Json -Depth 32 | Set-Content $global:PackageVersionManagerAppConfigPath
     }
 }
 
-# Exports
+# Move this to shared as it's a duplicate from StoredData
+function GetConfig() {
+    CreateUserProfileAppFolderIfItDoesNotExist
+    return Get-Content $global:PackageVersionManagerAppConfigPath -Raw | ConvertFrom-Json
+}
 
-Export-ModuleMember -Function "Get-*", "Set-*", "Test-*"
+function GetGitDirectories {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateScript({ 
+                return -not(($_ | Where-Object { -not (Test-Path -Path $_ -PathType Container) }).Count -gt 0)
+            })]
+        [string[]] $DirectoryPaths
+    )
+
+    $gitDirectories = $DirectoryPaths | ForEach-Object { 
+        $dirs = Get-ChildItem -Path $_ -Recurse -Directory -Include ".git" 
+        if ($dirs.Count -gt 2) {
+            throw "Multiple (nested) .git directories currently not supported"
+        }
+        return $dirs
+    }
+
+    return $gitDirectories | ForEach-Object { [GitDirectory]::new($_.Parent.FullName) }
+}
+
+Export-ModuleMember -Function "Get-*", "Set-*", "Test-*", "Edit-*"
